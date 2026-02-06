@@ -275,7 +275,27 @@ if (isOpenAI) {
     config.agents.defaults.models['anthropic/claude-haiku-4-5-20251001'] = { alias: 'Haiku 4.5' };
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5-20251101';
 } else {
-    // Default to Anthropic without custom base URL (uses built-in pi-ai catalog)
+    // Default to Anthropic - if API key is set, configure provider explicitly
+    // Otherwise use built-in pi-ai catalog (requires OAuth)
+    if (process.env.ANTHROPIC_API_KEY) {
+        console.log('Configuring Anthropic provider with API key');
+        config.models = config.models || {};
+        config.models.providers = config.models.providers || {};
+        config.models.providers.anthropic = {
+            baseUrl: 'https://api.anthropic.com/v1',
+            api: 'anthropic-messages',
+            apiKey: process.env.ANTHROPIC_API_KEY,
+            models: [
+                { id: 'claude-opus-4-5', name: 'Claude Opus 4.5', contextWindow: 200000 },
+                { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5', contextWindow: 200000 },
+                { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: 200000 },
+            ]
+        };
+        config.agents.defaults.models = config.agents.defaults.models || {};
+        config.agents.defaults.models['anthropic/claude-opus-4-5'] = { alias: 'Opus 4.5' };
+        config.agents.defaults.models['anthropic/claude-sonnet-4-5'] = { alias: 'Sonnet 4.5' };
+        config.agents.defaults.models['anthropic/claude-haiku-4-5'] = { alias: 'Haiku 4.5' };
+    }
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5';
 }
 
