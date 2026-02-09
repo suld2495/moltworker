@@ -15,6 +15,13 @@ if pgrep -f "clawdbot gateway" > /dev/null 2>&1; then
     exit 0
 fi
 
+# If port is already bound, another gateway instance is active (possibly daemonized)
+# and not necessarily visible via the sandbox process list.
+if (echo > /dev/tcp/127.0.0.1/18789) > /dev/null 2>&1; then
+    echo "Port 18789 is already in use, assuming Moltbot gateway is running. Exiting."
+    exit 0
+fi
+
 # Paths (clawdbot paths are used internally - upstream hasn't renamed yet)
 CONFIG_DIR="/root/.clawdbot"
 CONFIG_FILE="$CONFIG_DIR/clawdbot.json"
@@ -133,7 +140,7 @@ fi
 # ============================================================
 # UPDATE CONFIG FROM ENVIRONMENT VARIABLES
 # ============================================================
-node << EOFNODE
+node << 'EOFNODE'
 const fs = require('fs');
 
 const configPath = '/root/.clawdbot/clawdbot.json';
@@ -152,6 +159,60 @@ config.agents.defaults = config.agents.defaults || {};
 config.agents.defaults.model = config.agents.defaults.model || {};
 config.gateway = config.gateway || {};
 config.channels = config.channels || {};
+
+// Redact secrets before logging config to stdout
+function redactSecrets(value) {
+    if (Array.isArray(value)) {
+        return value.map(redactSecrets);
+    }
+    if (!value || typeof value !== 'object') {
+        return value;
+    }
+
+    const redacted = {};
+    for (const [key, child] of Object.entries(value)) {
+        const lowerKey = key.toLowerCase();
+        const shouldRedact = lowerKey.includes('key') || lowerKey.includes('token') || lowerKey.includes('secret');
+        redacted[key] = shouldRedact ? '[REDACTED]' : redactSecrets(child);
+    }
+    return redacted;
+}
+
+const preferredAnthropicModel = (process.env.ANTHROPIC_MODEL || '').trim();
+const defaultAnthropicModels = [
+    { id: 'claude-opus-4-1-20250805', name: 'Claude Opus 4.1', contextWindow: 200000 },
+    { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', contextWindow: 200000 },
+    { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', contextWindow: 200000 },
+];
+
+function getAnthropicModels() {
+    if (!preferredAnthropicModel) {
+        return defaultAnthropicModels;
+    }
+    const alreadyIncluded = defaultAnthropicModels.some((m) => m.id === preferredAnthropicModel);
+    if (alreadyIncluded) {
+        return defaultAnthropicModels;
+    }
+    return [
+        { id: preferredAnthropicModel, name: preferredAnthropicModel, contextWindow: 200000 },
+        ...defaultAnthropicModels,
+    ];
+}
+
+function getPrimaryAnthropicModel(models) {
+    if (preferredAnthropicModel) {
+        return preferredAnthropicModel;
+    }
+    const sonnet = models.find((m) => m.id.includes('sonnet'));
+    return sonnet ? sonnet.id : models[0].id;
+}
+
+function setAnthropicAllowlist(models) {
+    config.agents.defaults.models = config.agents.defaults.models || {};
+    for (const model of models) {
+        config.agents.defaults.models[`anthropic/${model.id}`] = { alias: model.name };
+    }
+}
 
 // Clean up any broken anthropic provider config from previous runs
 // (older versions didn't include required 'name' field)
@@ -254,26 +315,19 @@ if (isOpenAI) {
     console.log('Configuring Anthropic provider with base URL:', baseUrl);
     config.models = config.models || {};
     config.models.providers = config.models.providers || {};
+    const anthropicModels = getAnthropicModels();
     const providerConfig = {
         baseUrl: baseUrl,
         api: 'anthropic-messages',
-        models: [
-            { id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', contextWindow: 200000 },
-            { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', contextWindow: 200000 },
-            { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', contextWindow: 200000 },
-        ]
+        models: anthropicModels
     };
     // Include API key in provider config if set (required when using custom baseUrl)
     if (process.env.ANTHROPIC_API_KEY) {
         providerConfig.apiKey = process.env.ANTHROPIC_API_KEY;
     }
     config.models.providers.anthropic = providerConfig;
-    // Add models to the allowlist so they appear in /models
-    config.agents.defaults.models = config.agents.defaults.models || {};
-    config.agents.defaults.models['anthropic/claude-opus-4-5-20251101'] = { alias: 'Opus 4.5' };
-    config.agents.defaults.models['anthropic/claude-sonnet-4-5-20250929'] = { alias: 'Sonnet 4.5' };
-    config.agents.defaults.models['anthropic/claude-haiku-4-5-20251001'] = { alias: 'Haiku 4.5' };
-    config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5-20251101';
+    setAnthropicAllowlist(anthropicModels);
+    config.agents.defaults.model.primary = `anthropic/${getPrimaryAnthropicModel(anthropicModels)}`;
 } else {
     // Default to Anthropic - if API key is set, configure provider explicitly
     // Otherwise use built-in pi-ai catalog (requires OAuth)
@@ -281,28 +335,28 @@ if (isOpenAI) {
         console.log('Configuring Anthropic provider with API key');
         config.models = config.models || {};
         config.models.providers = config.models.providers || {};
+        const anthropicModels = getAnthropicModels();
         config.models.providers.anthropic = {
             baseUrl: 'https://api.anthropic.com/v1',
             api: 'anthropic-messages',
             apiKey: process.env.ANTHROPIC_API_KEY,
-            models: [
-                { id: 'claude-opus-4-5', name: 'Claude Opus 4.5', contextWindow: 200000 },
-                { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5', contextWindow: 200000 },
-                { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: 200000 },
-            ]
+            models: anthropicModels
         };
-        config.agents.defaults.models = config.agents.defaults.models || {};
-        config.agents.defaults.models['anthropic/claude-opus-4-5'] = { alias: 'Opus 4.5' };
-        config.agents.defaults.models['anthropic/claude-sonnet-4-5'] = { alias: 'Sonnet 4.5' };
-        config.agents.defaults.models['anthropic/claude-haiku-4-5'] = { alias: 'Haiku 4.5' };
+        setAnthropicAllowlist(anthropicModels);
+        config.agents.defaults.model.primary = `anthropic/${getPrimaryAnthropicModel(anthropicModels)}`;
+        if (preferredAnthropicModel) {
+            console.log('Using ANTHROPIC_MODEL override:', preferredAnthropicModel);
+        }
     }
-    config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5';
+    if (!config.agents.defaults.model.primary) {
+        config.agents.defaults.model.primary = 'anthropic/claude-sonnet-4-20250514';
+    }
 }
 
 // Write updated config
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration updated successfully');
-console.log('Config:', JSON.stringify(config, null, 2));
+console.log('Config:', JSON.stringify(redactSecrets(config), null, 2));
 EOFNODE
 
 # ============================================================

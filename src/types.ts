@@ -13,6 +13,7 @@ export interface MoltbotEnv {
   // Legacy direct provider configuration (fallback)
   ANTHROPIC_API_KEY?: string;
   ANTHROPIC_BASE_URL?: string;
+  ANTHROPIC_MODEL?: string; // Optional explicit Anthropic model override (e.g., claude-sonnet-4-20250514)
   OPENAI_API_KEY?: string;
   MOLTBOT_GATEWAY_TOKEN?: string; // Gateway token (mapped to CLAWDBOT_GATEWAY_TOKEN for container)
 
@@ -21,6 +22,8 @@ export interface MoltbotEnv {
   E2E_TEST_MODE?: string; // Set to 'true' for E2E tests (skips CF Access auth but keeps device pairing)
   DEBUG_ROUTES?: string; // Set to 'true' to enable /debug/* routes
   SANDBOX_SLEEP_AFTER?: string; // How long before sandbox sleeps: 'never' (default), or duration like '10m', '1h'
+  SANDBOX_NAME?: string; // Optional sandbox identity override (default: "moltbot")
+  DISABLE_CRON_SYNC?: string; // Set to 'true' to disable scheduled R2 sync during incident recovery
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_DM_POLICY?: string;
   DISCORD_BOT_TOKEN?: string;

@@ -36,6 +36,28 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
 }
 
 /**
+ * Check whether the gateway port is reachable, even if no process is reported.
+ *
+ * This handles cases where the gateway is already listening but not visible
+ * in sandbox.listProcesses() due to process supervision/runtime behavior.
+ */
+export async function isMoltbotGatewayReachable(sandbox: Sandbox): Promise<boolean> {
+  try {
+    const response = await sandbox.containerFetch(
+      new Request(`http://localhost:${MOLTBOT_PORT}/`),
+      MOLTBOT_PORT
+    );
+    // Treat 5xx as not ready to avoid false positives during container networking errors.
+    if (response.status >= 500) {
+      return false;
+    }
+    return response.status >= 100 && response.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Ensure the Moltbot gateway is running
  * 
  * This will:
@@ -45,9 +67,8 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
  * 
  * @param sandbox - The sandbox instance
  * @param env - Worker environment bindings
- * @returns The running gateway process
  */
-export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): Promise<Process> {
+export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): Promise<void> {
   // Mount R2 storage for persistent data (non-blocking if not configured)
   // R2 is used as a backup - the startup script will restore from it on boot
   await mountR2Storage(sandbox, env);
@@ -57,15 +78,24 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
   if (existingProcess) {
     console.log('Found existing Moltbot process:', existingProcess.id, 'status:', existingProcess.status);
 
-    // Always use full startup timeout - a process can be "running" but not ready yet
-    // (e.g., just started by another concurrent request). Using a shorter timeout
-    // causes race conditions where we kill processes that are still initializing.
+    // A process reported as "running" but not listening is usually stuck.
+    // Use a shorter timeout in this case so we can recover quickly.
+    const waitTimeout =
+      existingProcess.status === 'running'
+        ? 15000
+        : STARTUP_TIMEOUT_MS;
+
     try {
-      console.log('Waiting for Moltbot gateway on port', MOLTBOT_PORT, 'timeout:', STARTUP_TIMEOUT_MS);
-      await existingProcess.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
+      console.log('Waiting for Moltbot gateway on port', MOLTBOT_PORT, 'timeout:', waitTimeout);
+      await existingProcess.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: waitTimeout });
       console.log('Moltbot gateway is reachable');
-      return existingProcess;
+      return;
     } catch (e) {
+      // Race-safe fallback: if the port is now reachable, proceed without restart.
+      if (await isMoltbotGatewayReachable(sandbox)) {
+        console.log('Gateway became reachable during wait; continuing');
+        return;
+      }
       // Timeout waiting for port - process is likely dead or stuck, kill and restart
       console.log('Existing process not reachable after full timeout, killing and restarting...');
       try {
@@ -74,6 +104,12 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
         console.log('Failed to kill process:', killError);
       }
     }
+  }
+
+  // Process may be untracked while gateway still listens on the port.
+  if (await isMoltbotGatewayReachable(sandbox)) {
+    console.log('Gateway is reachable on port', MOLTBOT_PORT, 'without a tracked process');
+    return;
   }
 
   // Start a new Moltbot gateway
@@ -105,6 +141,11 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
     if (logs.stdout) console.log('[Gateway] stdout:', logs.stdout);
     if (logs.stderr) console.log('[Gateway] stderr:', logs.stderr);
   } catch (e) {
+    // start-moltbot.sh may exit early when another gateway already bound the port.
+    if (await isMoltbotGatewayReachable(sandbox)) {
+      console.log('[Gateway] Port is reachable despite startup process failure; continuing');
+      return;
+    }
     console.error('[Gateway] waitForPort failed:', e);
     try {
       const logs = await process.getLogs();
@@ -119,6 +160,4 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
 
   // Verify gateway is actually responding
   console.log('[Gateway] Verifying gateway health...');
-  
-  return process;
 }

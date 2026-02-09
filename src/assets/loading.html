@@ -146,7 +146,7 @@
         const data = await response.json();
         consecutiveErrors = 0;
         
-        if (data.ok && data.status === 'running') {
+        if (data.ok) {
           // Container is ready! Reload the page
           titleEl.innerHTML = '<span class="ready">Moltworker is ready!</span>';
           statusEl.textContent = 'Redirecting...';
@@ -160,7 +160,15 @@
         }
         
         // Update status message based on state
-        if (data.status === 'not_running') {
+        if (data.status === 'error') {
+          const message = data.hardError
+            ? 'Container limit exceeded. Stop old live instances in Cloudflare Containers and try again.'
+            : (data.error || 'Gateway status check failed');
+          errorEl.textContent = message;
+          errorEl.style.display = 'block';
+          statusEl.textContent = 'Startup blocked';
+          return; // Stop polling on hard errors to avoid request loops
+        } else if (data.status === 'not_running') {
           statusEl.textContent = 'Container is starting up...';
         } else if (data.status === 'not_responding') {
           statusEl.textContent = 'Container started, waiting for gateway...';

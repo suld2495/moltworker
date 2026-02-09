@@ -21,12 +21,12 @@
  */
 
 import { Hono } from 'hono';
-import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
+import { getSandbox, Sandbox as CloudflareSandbox, type SandboxOptions } from '@cloudflare/sandbox';
 
 import type { AppEnv, MoltbotEnv } from './types';
 import { MOLTBOT_PORT } from './config';
 import { createAccessMiddleware } from './auth';
-import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2 } from './gateway';
+import { ensureMoltbotGateway, isMoltbotGatewayReachable, syncToR2 } from './gateway';
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
 import { redactSensitiveParams } from './utils/logging';
 import loadingPageHtml from './assets/loading.html';
@@ -47,7 +47,24 @@ function transformErrorMessage(message: string, host: string): string {
   return message;
 }
 
-export { Sandbox };
+function isContainerPortNotListeningError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes('not listening in the tcp address');
+}
+
+async function isContainerPortNotListeningResponse(response: Response): Promise<boolean> {
+  if (response.status < 500) {
+    return false;
+  }
+  try {
+    const body = await response.clone().text();
+    return body.toLowerCase().includes('not listening in the tcp address');
+  } catch {
+    return false;
+  }
+}
+
+export { CloudflareSandbox as Sandbox, CloudflareSandbox as SandboxV2 };
 
 /**
  * Validate required environment variables.
@@ -109,6 +126,11 @@ function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
   return { sleepAfter };
 }
 
+function getSandboxName(env: MoltbotEnv): string {
+  const name = env.SANDBOX_NAME?.trim();
+  return name && name.length > 0 ? name : 'moltbot';
+}
+
 // Main app
 const app = new Hono<AppEnv>();
 
@@ -130,7 +152,7 @@ app.use('*', async (c, next) => {
 // Middleware: Initialize sandbox for all requests
 app.use('*', async (c, next) => {
   const options = buildSandboxOptions(c.env);
-  const sandbox = getSandbox(c.env.Sandbox, 'moltbot', options);
+  const sandbox = getSandbox(c.env.Sandbox, getSandboxName(c.env), options);
   c.set('sandbox', sandbox);
   await next();
 });
@@ -222,12 +244,13 @@ app.all('*', async (c) => {
   const sandbox = c.get('sandbox');
   const request = c.req.raw;
   const url = new URL(request.url);
+  const redactedSearch = redactSensitiveParams(url);
 
   console.log('[PROXY] Handling request:', url.pathname);
 
   // Check if gateway is already running
-  const existingProcess = await findExistingMoltbotProcess(sandbox);
-  const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
+  const isGatewayReachable = await isMoltbotGatewayReachable(sandbox);
+  const isGatewayReady = isGatewayReachable;
 
   // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
   const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
@@ -271,15 +294,27 @@ app.all('*', async (c) => {
   // Proxy to Moltbot with WebSocket message interception
   if (isWebSocketRequest) {
     const debugLogs = c.env.DEBUG_ROUTES === 'true';
-    const redactedSearch = redactSensitiveParams(url);
 
     console.log('[WS] Proxying WebSocket connection to Moltbot');
     if (debugLogs) {
       console.log('[WS] URL:', url.pathname + redactedSearch);
     }
 
-    // Get WebSocket connection to the container
-    const containerResponse = await sandbox.wsConnect(request, MOLTBOT_PORT);
+    // Get WebSocket connection to the container (retry once if port is transitioning)
+    let containerResponse: Response;
+    try {
+      containerResponse = await sandbox.wsConnect(request, MOLTBOT_PORT);
+    } catch (error) {
+      if (!isContainerPortNotListeningError(error)) throw error;
+      console.warn('[WS] Container port was not listening. Re-ensuring gateway and retrying once...');
+      await ensureMoltbotGateway(sandbox, c.env);
+      containerResponse = await sandbox.wsConnect(request, MOLTBOT_PORT);
+    }
+    if (await isContainerPortNotListeningResponse(containerResponse)) {
+      console.warn('[WS] Container returned not-listening response. Re-ensuring gateway and retrying once...');
+      await ensureMoltbotGateway(sandbox, c.env);
+      containerResponse = await sandbox.wsConnect(request, MOLTBOT_PORT);
+    }
     console.log('[WS] wsConnect response status:', containerResponse.status);
 
     // Get the container-side WebSocket
@@ -399,8 +434,22 @@ app.all('*', async (c) => {
     });
   }
 
-  console.log('[HTTP] Proxying:', url.pathname + url.search);
-  const httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
+  console.log('[HTTP] Proxying:', url.pathname + redactedSearch);
+  let httpResponse: Response;
+  try {
+    httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
+  } catch (error) {
+    if (!isContainerPortNotListeningError(error)) throw error;
+
+    console.warn('[HTTP] Container port was not listening. Re-ensuring gateway and retrying once...');
+    await ensureMoltbotGateway(sandbox, c.env);
+    httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
+  }
+  if (await isContainerPortNotListeningResponse(httpResponse)) {
+    console.warn('[HTTP] Container returned not-listening response. Re-ensuring gateway and retrying once...');
+    await ensureMoltbotGateway(sandbox, c.env);
+    httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
+  }
   console.log('[HTTP] Response status:', httpResponse.status);
 
   // Add debug header to verify worker handled the request
@@ -424,8 +473,13 @@ async function scheduled(
   env: MoltbotEnv,
   _ctx: ExecutionContext
 ): Promise<void> {
+  if (env.DISABLE_CRON_SYNC === 'true') {
+    console.log('[cron] Skipping backup sync (DISABLE_CRON_SYNC=true)');
+    return;
+  }
+
   const options = buildSandboxOptions(env);
-  const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
+  const sandbox = getSandbox(env.Sandbox, getSandboxName(env), options);
 
   console.log('[cron] Starting backup sync to R2...');
   const result = await syncToR2(sandbox, env);

@@ -15,6 +15,12 @@ describe('buildEnvVars', () => {
     expect(result.ANTHROPIC_API_KEY).toBe('sk-test-key');
   });
 
+  it('includes ANTHROPIC_MODEL when set', () => {
+    const env = createMockEnv({ ANTHROPIC_MODEL: 'claude-sonnet-4-20250514' });
+    const result = buildEnvVars(env);
+    expect(result.ANTHROPIC_MODEL).toBe('claude-sonnet-4-20250514');
+  });
+
   it('maps AI_GATEWAY_API_KEY to ANTHROPIC_API_KEY for Anthropic gateway', () => {
     const env = createMockEnv({
       AI_GATEWAY_API_KEY: 'sk-gateway-key',
