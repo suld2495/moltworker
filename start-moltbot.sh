@@ -337,7 +337,7 @@ if (isOpenAI) {
         config.models.providers = config.models.providers || {};
         const anthropicModels = getAnthropicModels();
         config.models.providers.anthropic = {
-            baseUrl: 'https://api.anthropic.com/v1',
+            baseUrl: 'https://api.anthropic.com',
             api: 'anthropic-messages',
             apiKey: process.env.ANTHROPIC_API_KEY,
             models: anthropicModels
